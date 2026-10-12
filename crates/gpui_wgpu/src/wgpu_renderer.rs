@@ -22,6 +22,7 @@ fn max_blur_radius(filters: &[ScaledFilter]) -> f32 {
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -158,13 +159,64 @@ struct WgpuBindGroupLayouts {
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
 pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
 
+/// What a set of render pipelines depends on. Nothing here is per window, so windows on the
+/// same device that agree on these share one compiled set.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PipelineKey {
+    surface_format: wgpu::TextureFormat,
+    alpha_mode: wgpu::CompositeAlphaMode,
+    path_sample_count: u32,
+    dual_source_blending: bool,
+}
+
+/// Device-level pipeline state shared by every renderer on one [`WgpuContext`].
+///
+/// Bind group layouts, shader modules and render pipelines are device objects, not window
+/// objects. Building them per window re-parses the WGSL and compiles and links ~13 programs on
+/// every window open, which is slow everywhere and, on drivers that retain memory per compiled
+/// program (Mesa virgl), a leak of a few MB per window. The cache lives as long as the device:
+/// a lost device gets a fresh [`WgpuContext`] and with it a fresh cache.
+#[derive(Default)]
+pub struct PipelineCache {
+    layouts: Mutex<Option<Arc<WgpuBindGroupLayouts>>>,
+    pipelines: Mutex<HashMap<PipelineKey, Arc<WgpuPipelines>>>,
+}
+
+impl PipelineCache {
+    fn layouts(&self, device: &wgpu::Device) -> Arc<WgpuBindGroupLayouts> {
+        let mut slot = self.layouts.lock().unwrap_or_else(|p| p.into_inner());
+        Arc::clone(slot.get_or_insert_with(|| {
+            Arc::new(WgpuRenderer::create_bind_group_layouts(device))
+        }))
+    }
+
+    fn pipelines(
+        &self,
+        device: &wgpu::Device,
+        layouts: &WgpuBindGroupLayouts,
+        key: PipelineKey,
+    ) -> Arc<WgpuPipelines> {
+        let mut map = self.pipelines.lock().unwrap_or_else(|p| p.into_inner());
+        Arc::clone(map.entry(key).or_insert_with(|| {
+            Arc::new(WgpuRenderer::create_pipelines(
+                device,
+                layouts,
+                key.surface_format,
+                key.alpha_mode,
+                key.path_sample_count,
+                key.dual_source_blending,
+            ))
+        }))
+    }
+}
+
 /// GPU resources that must be dropped together during device recovery.
 struct WgpuResources {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     surface: wgpu::Surface<'static>,
-    pipelines: WgpuPipelines,
-    bind_group_layouts: WgpuBindGroupLayouts,
+    pipelines: Arc<WgpuPipelines>,
+    bind_group_layouts: Arc<WgpuBindGroupLayouts>,
     atlas_sampler: wgpu::Sampler,
     surface_sampler: wgpu::Sampler,
     #[allow(dead_code)]
@@ -237,6 +289,8 @@ pub struct WgpuRenderer {
     #[allow(dead_code)]
     extra_requirements: Option<WgpuDeviceRequirements>,
     resources: Option<WgpuResources>,
+    /// The device's shared pipelines, so an alpha-mode change picks up a cached set too.
+    pipeline_cache: Arc<PipelineCache>,
     surface_config: wgpu::SurfaceConfiguration,
     atlas: Arc<WgpuAtlas>,
     path_globals_offset: u64,
@@ -461,14 +515,17 @@ impl WgpuRenderer {
         let dual_source_blending = context.supports_dual_source_blending();
 
         let rendering_params = RenderingParameters::new(&context.adapter, surface_format);
-        let bind_group_layouts = Self::create_bind_group_layouts(&device);
-        let pipelines = Self::create_pipelines(
+        let pipeline_cache = Arc::clone(&context.pipelines);
+        let bind_group_layouts = pipeline_cache.layouts(&device);
+        let pipelines = pipeline_cache.pipelines(
             &device,
             &bind_group_layouts,
-            surface_format,
-            alpha_mode,
-            rendering_params.path_sample_count,
-            dual_source_blending,
+            PipelineKey {
+                surface_format,
+                alpha_mode,
+                path_sample_count: rendering_params.path_sample_count,
+                dual_source_blending,
+            },
         );
 
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -615,6 +672,7 @@ impl WgpuRenderer {
             compositor_gpu,
             extra_requirements,
             resources: Some(resources),
+            pipeline_cache,
             surface_config,
             atlas,
             path_globals_offset,
@@ -1318,13 +1376,15 @@ impl WgpuRenderer {
             resources
                 .surface
                 .configure(&resources.device, &surface_config);
-            resources.pipelines = Self::create_pipelines(
+            resources.pipelines = self.pipeline_cache.pipelines(
                 &resources.device,
                 &resources.bind_group_layouts,
-                surface_config.format,
-                surface_config.alpha_mode,
-                path_sample_count,
-                dual_source_blending,
+                PipelineKey {
+                    surface_format: surface_config.format,
+                    alpha_mode: surface_config.alpha_mode,
+                    path_sample_count,
+                    dual_source_blending,
+                },
             );
         }
     }
