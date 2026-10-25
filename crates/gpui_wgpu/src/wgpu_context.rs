@@ -24,6 +24,87 @@ pub struct CompositorGpuHint {
     pub device_id: u32,
 }
 
+/// One native graphics API behind a [`WgpuContext`].
+///
+/// wgpu initializes every backend named in an instance's mask. The GL backend opens EGL and
+/// loads the GL driver (on Mesa that is gallium plus LLVM, around 50 MB resident) even when a
+/// Vulkan adapter is picked afterwards, so each API gets its own instance and they are tried
+/// in preference order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(not(target_family = "wasm"))]
+pub enum NativeBackend {
+    #[cfg(target_os = "windows")]
+    Dx12,
+    #[cfg(not(target_os = "windows"))]
+    Vulkan,
+    #[cfg(not(target_os = "windows"))]
+    Gl,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl NativeBackend {
+    #[cfg(target_os = "windows")]
+    pub const PREFERENCE: &'static [Self] = &[Self::Dx12];
+    #[cfg(not(target_os = "windows"))]
+    pub const PREFERENCE: &'static [Self] = &[Self::Vulkan, Self::Gl];
+
+    pub fn instance(self, display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) -> wgpu::Instance {
+        wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: self.into(),
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: Some(display),
+        })
+    }
+
+    /// Runs `attempt` for each backend in [`Self::PREFERENCE`] until one succeeds.
+    /// `WGPU_BACKEND`, the override variable wgpu itself reads, narrows the list.
+    pub fn try_in_preference_order<T>(
+        operation: &str,
+        mut attempt: impl FnMut(Self) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let allowed = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all());
+        let mut failures = Vec::new();
+        for &backend in Self::PREFERENCE {
+            if !allowed.contains(backend.into()) {
+                continue;
+            }
+            match attempt(backend) {
+                Ok(value) => return Ok(value),
+                Err(err) => {
+                    log::warn!("{backend:?} could not provide {operation}: {err:#}");
+                    failures.push(format!("{backend:?}: {err:#}"));
+                }
+            }
+        }
+        if failures.is_empty() {
+            anyhow::bail!(
+                "WGPU_BACKEND={allowed:?} excludes every native backend supported here ({:?})",
+                Self::PREFERENCE
+            );
+        }
+        anyhow::bail!(
+            "no native GPU backend could provide {operation}: {}",
+            failures.join("; ")
+        )
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl From<NativeBackend> for wgpu::Backends {
+    fn from(backend: NativeBackend) -> Self {
+        match backend {
+            #[cfg(target_os = "windows")]
+            NativeBackend::Dx12 => Self::DX12,
+            #[cfg(not(target_os = "windows"))]
+            NativeBackend::Vulkan => Self::VULKAN,
+            #[cfg(not(target_os = "windows"))]
+            NativeBackend::Gl => Self::GL,
+        }
+    }
+}
+
 /// Extra wgpu features and limits that an application can request on top of
 /// gpui's baseline.  Pass an instance to the platform via
 /// [`gpui::App::set_gpu_requirements`] *before* opening any windows.
@@ -60,7 +141,7 @@ impl WgpuContext {
     }
 
     #[cfg(not(target_family = "wasm"))]
-    fn new_with_options(
+    pub(crate) fn new_with_options(
         instance: wgpu::Instance,
         surface: &wgpu::Surface<'_>,
         compositor_gpu: Option<CompositorGpuHint>,
@@ -209,22 +290,6 @@ impl WgpuContext {
             dual_source_blending,
             color_atlas_texture_format,
         ))
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    pub fn instance(display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) -> wgpu::Instance {
-        #[cfg(not(target_os = "windows"))]
-        let backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
-        #[cfg(target_os = "windows")]
-        let backends = wgpu::Backends::DX12;
-
-        wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends,
-            flags: wgpu::InstanceFlags::default(),
-            backend_options: wgpu::BackendOptions::default(),
-            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-            display: Some(display),
-        })
     }
 
     pub fn check_compatible_with_surface(&self, surface: &wgpu::Surface<'_>) -> anyhow::Result<()> {
