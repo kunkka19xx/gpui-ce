@@ -203,6 +203,9 @@ pub struct WgpuContext {
     color_texture_format: wgpu::TextureFormat,
     renderer_tier: RendererTier,
     errors: Arc<DeviceErrorState>,
+    /// Bind group layouts and render pipelines compiled once per device and shared by
+    /// every window's renderer.
+    pipeline_cache: Arc<crate::wgpu_renderer::PipelineCache>,
 }
 
 /// The resource transport selected for a device.
@@ -496,6 +499,10 @@ pub struct WgpuDeviceRequirements {
 }
 
 impl WgpuContext {
+    pub(crate) fn pipeline_cache(&self) -> &Arc<crate::wgpu_renderer::PipelineCache> {
+        &self.pipeline_cache
+    }
+
     pub(crate) fn handle(&self, texture_format: wgpu::TextureFormat) -> WgpuContextHandle {
         WgpuContextHandle::from_resources(
             Arc::clone(&self.device),
@@ -680,6 +687,7 @@ impl WgpuContext {
             color_texture_format: device.color_texture_format,
             renderer_tier: device.renderer_tier,
             errors,
+            pipeline_cache: Arc::default(),
         })
     }
 
