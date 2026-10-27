@@ -85,13 +85,13 @@ impl WgpuAtlas {
         lock.flush_uploads();
     }
 
-    pub fn get_texture_info(&self, id: AtlasTextureId) -> WgpuTextureInfo {
+    pub fn get_texture_info(&self, id: AtlasTextureId) -> Option<WgpuTextureInfo> {
         let lock = self.0.lock();
-        let texture = &lock.storage[id];
-        WgpuTextureInfo {
+        let texture = lock.storage.get(id)?;
+        Some(WgpuTextureInfo {
             view: texture.view.clone(),
             identity: texture.identity,
-        }
+        })
     }
 
     /// Clears all cached textures and tiles, forcing them to be recreated.
@@ -121,11 +121,11 @@ impl WgpuAtlas {
 impl PlatformAtlas for WgpuAtlas {
     fn get_or_insert_with<'a>(
         &self,
-        key: &AtlasKey,
+        key: AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>> {
         let mut lock = self.0.lock();
-        if let Some(tile) = lock.tiles_by_key.get(key) {
+        if let Some(tile) = lock.tiles_by_key.get(&key) {
             return Ok(Some(*tile));
         }
 
@@ -134,7 +134,7 @@ impl PlatformAtlas for WgpuAtlas {
             return Ok(None);
         };
         key.texture_kind().validate_upload(size, &bytes)?;
-        let tile = lock.insert_tile(key.clone(), size, &bytes)?;
+        let tile = lock.insert_tile(key, size, &bytes)?;
 
         Ok(Some(tile))
     }
@@ -509,7 +509,7 @@ mod tests {
 
         // Regression test: before the fix, this panicked in flush_uploads
         atlas
-            .get_or_insert_with(&key, &mut build)?
+            .get_or_insert_with(key.clone(), &mut build)?
             .expect("tile should be created");
         atlas.remove(&key);
         atlas.before_frame();
@@ -539,7 +539,7 @@ mod tests {
         let insert = |key: &AtlasKey, size: Size<DevicePixels>| {
             let byte_count = (size.width.0 as usize) * (size.height.0 as usize) * 4;
             atlas
-                .get_or_insert_with(key, &mut || {
+                .get_or_insert_with(key.clone(), &mut || {
                     Ok(Some((size, Cow::Owned(vec![0u8; byte_count]))))
                 })
                 .expect("allocation should succeed")
@@ -576,7 +576,7 @@ mod tests {
         };
         let insert = |key: &AtlasKey| {
             atlas
-                .get_or_insert_with(key, &mut || {
+                .get_or_insert_with(key.clone(), &mut || {
                     Ok(Some((size, Cow::Owned(vec![0, 0, 0, 255]))))
                 })
                 .expect("allocation should succeed")
@@ -584,12 +584,21 @@ mod tests {
         };
 
         let first = insert(&key(1));
-        let identity = atlas.get_texture_info(first.texture_id).identity;
+        let identity = atlas
+            .get_texture_info(first.texture_id)
+            .expect("first texture is live")
+            .identity;
         atlas.remove(&key(1));
         let second = insert(&key(2));
 
         assert_eq!(first.texture_id, second.texture_id);
-        assert_ne!(atlas.get_texture_info(second.texture_id).identity, identity);
+        assert_ne!(
+            atlas
+                .get_texture_info(second.texture_id)
+                .expect("second texture is live")
+                .identity,
+            identity
+        );
         Ok(())
     }
 

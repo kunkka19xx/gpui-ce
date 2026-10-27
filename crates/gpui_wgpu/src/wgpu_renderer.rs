@@ -1,4 +1,14 @@
-use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext, WgpuContextHandle, WgpuDeviceRequirements};
+use crate::{
+    CompositorGpuHint, DeviceErrorState, WgpuAtlas, WgpuContext, WgpuContextHandle,
+    WgpuDeviceRequirements,
+};
+#[cfg(all(
+    test,
+    feature = "test-support",
+    not(target_family = "wasm"),
+    not(target_vendor = "apple")
+))]
+use crate::{RendererTier, WgpuBackend};
 use gpui::{DevicePixels, GpuSpecs, Scene, Size};
 
 #[cfg(test)]
@@ -14,7 +24,7 @@ use smallvec::{SmallVec, smallvec};
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 mod buffers;
 mod drawing;
@@ -42,7 +52,10 @@ use target::RenderTarget;
 pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
 
 struct GpuFaultState {
-    pending_error: Arc<Mutex<Option<String>>>,
+    device_errors: Arc<DeviceErrorState>,
+    observed_error_generation: u64,
+    // Surface acquisition errors are local to this renderer, unlike device-wide errors.
+    pending_error: Option<String>,
     consecutive_failed_frames: u32,
     device_lost: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(not(target_family = "wasm"))]
@@ -93,6 +106,9 @@ impl WgpuRenderer {
         extra_requirements: Option<WgpuDeviceRequirements>,
         atlas: Arc<WgpuAtlas>,
     ) -> anyhow::Result<Self> {
+        // The device may be shared with other renderers. Observe only errors raised from here
+        // on, including any while this renderer builds its pipelines.
+        let observed_error_generation = context.errors().current_generation();
         let target =
             RenderTarget::new(&context.adapter, &context.device, surface.as_ref(), config)?;
         if let Some(surface) = surface.as_ref() {
@@ -109,10 +125,7 @@ impl WgpuRenderer {
             &rendering_params,
             dual_source_blending,
         )?;
-        let ResourceMetadata {
-            globals,
-            last_error,
-        } = metadata;
+        let ResourceMetadata { globals } = metadata;
 
         Ok(Self {
             context: gpu_context,
@@ -128,7 +141,9 @@ impl WgpuRenderer {
             adapter_info,
             uploaded_globals: None,
             faults: GpuFaultState {
-                pending_error: last_error,
+                device_errors: Arc::clone(context.errors()),
+                observed_error_generation,
+                pending_error: None,
                 consecutive_failed_frames: 0,
                 device_lost: context.device_lost_flag(),
                 #[cfg(not(target_family = "wasm"))]
@@ -452,6 +467,7 @@ mod tests {
             order: 0,
             padding: 0,
             bounds,
+            clip_bounds: bounds,
             content_mask: gpui::ContentMask {
                 bounds,
                 ..Default::default()
@@ -469,6 +485,81 @@ mod tests {
             [128, 0, 0, 255],
             "must match the retired Metal renderer's mixed primitive baseline"
         );
+        Ok(())
+    }
+
+    /// The WebGL2 transport decodes instances from a data texture with generated decoders.
+    /// Drawing one scene through it and through storage buffers, on one adapter, checks them.
+    #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
+    #[test]
+    fn webgl2_transport_matches_storage_buffers() -> anyhow::Result<()> {
+        let context = WgpuContext::new_headless(None)?;
+        let size = gpui::size(DevicePixels(48), DevicePixels(24));
+        let content_mask = gpui::ContentMask {
+            bounds: test_bounds(0.0, 0.0, 48.0, 24.0),
+            ..Default::default()
+        };
+        let backgrounds = [
+            gpui::checkerboard(gpui::hsla(0.6, 0.7, 0.5, 1.0), 2.0),
+            gpui::linear_gradient(
+                90.0,
+                gpui::linear_color_stop(gpui::hsla(0.8, 0.9, 0.4, 1.0), 0.0),
+                gpui::linear_color_stop(gpui::hsla(0.1, 0.8, 0.6, 1.0), 1.0),
+            ),
+        ];
+        let mut scene = Scene::default();
+        for (index, background) in backgrounds.into_iter().enumerate() {
+            let bounds = test_bounds(4.0 + index as f32 * 22.0, 4.0, 18.0, 14.0);
+            scene.insert_primitive(gpui::Shadow {
+                order: 0,
+                blur_radius: ScaledPixels(2.0),
+                bounds,
+                content_mask,
+                color: gpui::hsla(0.0, 0.0, 0.0, 0.5).into(),
+                element_bounds: bounds,
+                corner_radii: gpui::Corners::all(ScaledPixels(4.0)),
+                element_corner_radii: gpui::Corners::all(ScaledPixels(4.0)),
+                inset: false.into(),
+                corner_smoothing: 0.0,
+            });
+            scene.insert_primitive(Quad {
+                bounds,
+                content_mask,
+                background,
+                border_style: gpui::BorderStyle::Dashed,
+                border_color: gpui::hsla(0.6, 0.9, 0.7, 1.0).into(),
+                border_widths: gpui::Edges::all(ScaledPixels(2.0)),
+                corner_radii: gpui::Corners::all(ScaledPixels(4.0)),
+                ..Default::default()
+            });
+        }
+        let underline = test_bounds(4.0, 19.0, 40.0, 4.0);
+        scene.insert_primitive(Underline {
+            order: 0,
+            padding: 0,
+            bounds: underline,
+            clip_bounds: underline,
+            content_mask,
+            color: gpui::hsla(0.0, 1.0, 0.5, 1.0).into(),
+            thickness: ScaledPixels(1.0),
+            wavy: true.into(),
+        });
+        scene.finish();
+
+        let storage = WgpuRenderer::new_headless(&context, size)?.render_to_image(&scene)?;
+        let webgl2 = WgpuRenderer::new_headless(&context.with_webgl2_transport(), size)?
+            .render_to_image(&scene)?;
+        assert!(storage.pixels().any(|pixel| pixel.0 != [0, 0, 0, 255]));
+        for (x, y, pixel) in webgl2.enumerate_pixels() {
+            let expected = storage.get_pixel(x, y).0;
+            assert!(
+                pixel.0.iter().zip(expected).all(|(drawn, expected)| {
+                    drawn.abs_diff(expected) <= MAX_CROSS_BACKEND_CHANNEL_DELTA
+                }),
+                "pixel ({x}, {y}): the WebGL2 transport drew {:?}, storage buffers drew {expected:?}",
+                pixel.0
+            );
+        }
         Ok(())
     }
 
@@ -751,6 +842,7 @@ mod tests {
                 order: index * 2 + 1,
                 padding: 0,
                 bounds,
+                clip_bounds: bounds,
                 content_mask: gpui::ContentMask {
                     bounds,
                     ..Default::default()
@@ -833,7 +925,7 @@ mod tests {
         let mut renderers: Vec<Box<dyn gpui::PlatformHeadlessRenderer>> =
             vec![Box::new(WgpuHeadlessRenderer::new()?)];
 
-        if let Some(native) = gpui_platform::current_headless_renderer() {
+        if let Some(native) = gpui_platform::current_headless_renderer()? {
             renderers.push(native);
         }
 
